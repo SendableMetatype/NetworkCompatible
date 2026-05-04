@@ -29,6 +29,7 @@ import io.netty.util.internal.logging.InternalLoggerFactory;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.util.List;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 
 public class NetherNetServerChannel extends AbstractServerChannel {
@@ -96,7 +97,7 @@ public class NetherNetServerChannel extends AbstractServerChannel {
         ServerPeerConnectionObserver observer = new ServerPeerConnectionObserver(connectionId, remoteNetworkId);
         RTCPeerConnection pc = factory.createPeerConnection(rtcConfig, observer);
 
-        NetherNetChildChannel child = new NetherNetChildChannel(this, pc, new InetSocketAddress(0), localAddress);
+        NetherNetChildChannel child = new NetherNetChildChannel(this, pc, generatePlaceholderAddress(), localAddress);
         observer.setChildChannel(child);
 
         child.closeFuture().addListener(future -> signaling.removeSignalHandler(connectionId));
@@ -244,12 +245,80 @@ public class NetherNetServerChannel extends AbstractServerChannel {
 
                 log.debug("Data Channels established for {}", Long.toUnsignedString(this.connectionId));
                 child.setDataChannels(reliable, unreliable);
-                
-                if (child.pipeline() != null) {
-                    child.pipeline().fireChannelActive();
-                }
+                resolveRemoteAddressThenActivate(child);
             }
         }
+
+        private void resolveRemoteAddressThenActivate(NetherNetChildChannel child) {
+            java.util.concurrent.atomic.AtomicBoolean activated = new java.util.concurrent.atomic.AtomicBoolean(false);
+
+            // Fallback: activate after 2 seconds if stats callback never fires
+            ScheduledFuture<?> fallback = eventLoop().schedule(() -> {
+                activateOnce(child, activated);
+            }, 2, TimeUnit.SECONDS);
+
+            try {
+                child.peerConnection.getStats(report -> {
+                    try {
+                        String remoteId = null;
+                        for (var entry : report.getStats().entrySet()) {
+                            var stats = entry.getValue();
+                            if (stats.getType() == dev.kastle.webrtc.RTCStatsType.CANDIDATE_PAIR) {
+                                Object selected = stats.getAttributes().get("nominated");
+                                if (Boolean.TRUE.equals(selected)) {
+                                    remoteId = (String) stats.getAttributes().get("remoteCandidateId");
+                                    break;
+                                }
+                            }
+                        }
+                        if (remoteId != null) {
+                            var remoteStat = report.getStats().get(remoteId);
+                            if (remoteStat != null) {
+                                String ip = (String) remoteStat.getAttributes().get("ip");
+                                Object portObj = remoteStat.getAttributes().get("port");
+                                if (ip != null && portObj != null) {
+                                    int port = (portObj instanceof Number) ? ((Number) portObj).intValue() : Integer.parseInt(portObj.toString());
+                                    child.remoteAddress = new InetSocketAddress(ip, port);
+                                    log.debug("Resolved remote address for {}: {}:{}", Long.toUnsignedString(connectionId), ip, port);
+                                }
+                            }
+                        }
+                    } catch (Exception e) {
+                        log.debug("Failed to resolve remote address for {}: {}", Long.toUnsignedString(connectionId), e.getMessage());
+                    } finally {
+                        fallback.cancel(false);
+                        activateOnce(child, activated);
+                    }
+                });
+            } catch (Exception e) {
+                log.debug("Failed to get stats for {}: {}", Long.toUnsignedString(connectionId), e.getMessage());
+                fallback.cancel(false);
+                activateOnce(child, activated);
+            }
+        }
+
+        private void activateOnce(NetherNetChildChannel child, java.util.concurrent.atomic.AtomicBoolean activated) {
+            if (!activated.compareAndSet(false, true)) {
+                return;
+            }
+            child.eventLoop().execute(() -> {
+                if (child.isOpen() && child.pipeline() != null) {
+                    child.pipeline().fireChannelActive();
+                }
+            });
+        }
+    }
+
+    /**
+     * Generates a unique placeholder address in the 0.x.x.x range for a new
+     * Nethernet connection. This is used as the initial remote address before
+     * ICE candidate resolution completes. The 0.0.0.0/8 range is reserved
+     * ("this network") and will never collide with a real client address.
+     */
+    private static InetSocketAddress generatePlaceholderAddress() {
+        ThreadLocalRandom r = ThreadLocalRandom.current();
+        String ip = "0." + (r.nextInt(1, 256)) + "." + (r.nextInt(256)) + "." + (r.nextInt(1, 256));
+        return new InetSocketAddress(ip, 0);
     }
 
     @Override
