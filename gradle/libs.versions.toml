@@ -1,7 +1,7 @@
 [versions]
 netty = "4.1.130.Final"
 junit = "5.14.1"
-webrtc-java = "1.0.3"
+webrtc-java = "1.0.4-edu.1"
 gson = "2.13.2"
 nmcp = "1.4.0"
 
